@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>超慢跑步頻計時器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 載入 Tone.js 函式庫，用於精準音訊生成 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1a202c; /* 深藍色背景 */
+        }
+        .timer-display {
+            font-family: 'Monospace', monospace;
+            text-shadow: 0 0 10px rgba(79, 70, 229, 0.7);
+        }
+    </style>
+    <script>
+        // 設定 Tailwind CSS 配置
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary': '#4f46e5', /* Indigo-600 */
+                        'accent': '#10b981',  /* Emerald-500 */
+                        'warning': '#f59e0b', /* Amber-500 */
+                    }
+                }
+            }
+        }
+
+        // --- 遊戲狀態變數 ---
+        const PREP_TIME = 30; // 30秒預備
+        const RUN_TIME = 20 * 60; // 20分鐘跑步 (1200秒)
+        const BPM = 180; // 跑步頻率
+        const BEAT_INTERVAL = 60 / BPM; // 節拍間隔 (約 0.3333 秒)
+
+        let currentPhase = 'STOPPED'; // STOPPED, PREP, RUNNING, FINISH
+        let remainingTime = RUN_TIME;
+        let timerInterval = null;
+        let beatLoop = null; // Tone.js 的節拍循環
+        let beatCount = 0; // 節拍計數器 (0, 1, 2, 3)
+        let totalRunTimeElapsed = 0; // 跑步階段經過時間
+        let isPaused = false; // 新增：暫停狀態
+
+        // --- Tone.js 音效初始化 ---
+        let prepSynth, runSynthLow, runSynthHigh, finishSynth;
+        let isAudioContextReady = false;
+
+        // 初始化所有音效合成器
+        function initializeAudio() {
+            if (isAudioContextReady) return;
+
+            // 預備/倒數提示音
+            prepSynth = new Tone.Synth({
+                oscillator: { type: "square" },
+                envelope: { attack: 0.01, decay: 0.1, sustain: 0.0, release: 0.1 }
+            }).toDestination();
+
+            // 跑步低頻節拍 (C4)
+            runSynthLow = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.005, decay: 0.08, sustain: 0.0, release: 0.08 }
+            }).toDestination();
+
+            // 跑步高頻節拍 (G4)
+            runSynthHigh = new Tone.Synth({
+                oscillator: { type: "square" },
+                envelope: { attack: 0.005, decay: 0.08, sustain: 0.0, release: 0.08 }
+            }).toDestination();
+
+            // 結束長音 (C5)
+            finishSynth = new Tone.Synth({
+                oscillator: { type: "triangle" },
+                envelope: { attack: 0.1, decay: 0.5, sustain: 0.7, release: 2.4 } // 總長約 3 秒
+            }).toDestination();
+            
+            isAudioContextReady = true;
+            Tone.start(); // 啟動 AudioContext
+            console.log("Audio Context Ready");
+        }
+
+        // --- DOM 元素獲取與更新 ---
+        const statusDisplay = () => document.getElementById('statusDisplay');
+        const timeDisplay = () => document.getElementById('timeDisplay');
+        const startButton = () => document.getElementById('startButton');
+        const pauseButton = () => document.getElementById('pauseButton');
+        const resetButton = () => document.getElementById('resetButton');
+
+        function updateDisplay() {
+            const minutes = Math.floor(remainingTime / 60);
+            const seconds = remainingTime % 60;
+            const timeString = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+            timeDisplay().textContent = timeString;
+
+            let statusText = '';
+            let statusColor = 'text-white';
+            
+            if (isPaused) {
+                statusText = '暫停中...';
+                statusColor = 'text-warning';
+            } else {
+                switch(currentPhase) {
+                    case 'STOPPED':
+                        statusText = '超慢跑計時器 - 準備開始';
+                        break;
+                    case 'PREP':
+                        statusText = '預備：倒數中...';
+                        statusColor = 'text-yellow-400';
+                        break;
+                    case 'RUNNING':
+                        const beat = beatCount === 3 ? '高' : '低';
+                        statusText = `跑步中 (${BPM} BPM) - 節拍: ${beat}`;
+                        statusColor = 'text-accent';
+                        break;
+                    case 'FINISH':
+                        statusText = '訓練結束！請放鬆';
+                        statusColor = 'text-red-500';
+                        break;
+                }
+            }
+            statusDisplay().textContent = statusText;
+            statusDisplay().className = `text-lg font-semibold ${statusColor} text-center mb-4`;
+            
+            // 更新按鈕狀態
+            startButton().disabled = currentPhase !== 'STOPPED' || isPaused;
+            resetButton().disabled = currentPhase === 'STOPPED' && !isPaused;
+            pauseButton().disabled = currentPhase === 'STOPPED' || currentPhase === 'FINISH';
+        }
+
+        // --- Phase 1: 預備階段 (30秒倒數) ---
+
+        function playPrepCue(time) {
+            // 每 5 秒提示音 (30, 25, 20, 15, 10)
+            if (time % 5 === 0 && time > 5) {
+                prepSynth.triggerAttackRelease("A4", "8n"); // [調整音調 A3]: 預備階段標準提示音
+            }
+            // 最後 5 秒每一秒提示音 (5, 4, 3, 2, 1)
+            else if (time <= 5 && time > 0) {
+                prepSynth.triggerAttackRelease("C5", "16n"); // [調整音調 C4]: 預備階段緊急提示音 (比 A4 高)
+            }
+        }
+        
+        // 預備階段的計時邏輯
+        function startPrepInterval() {
+            timerInterval = setInterval(() => {
+                remainingTime--;
+                playPrepCue(remainingTime);
+                updateDisplay();
+
+                if (remainingTime <= 0) {
+                    clearInterval(timerInterval);
+                    startRunningPhase();
+                }
+            }, 1000);
+        }
+
+        function startPreparation() {
+            currentPhase = 'PREP';
+            remainingTime = PREP_TIME;
+            updateDisplay();
+            
+            // 啟用暫停按鈕並設置為「暫停」
+            pauseButton().textContent = '暫停訓練';
+            pauseButton().classList.replace('bg-accent', 'bg-warning');
+            
+            playPrepCue(remainingTime); // 播放 30 秒的提示音
+            startPrepInterval();
+        }
+
+        // --- Phase 2: 跑步階段 (20分鐘，180 BPM 節拍) ---
+
+        // 跑步階段的計時邏輯
+        function startRunInterval() {
+            timerInterval = setInterval(() => {
+                remainingTime--;
+                totalRunTimeElapsed++;
+
+                if (remainingTime <= 0) {
+                    clearInterval(timerInterval);
+                    stopRunningPhase();
+                }
+            }, 1000);
+        }
+
+        function startRunningPhase() {
+            currentPhase = 'RUNNING';
+            // 如果是從預備階段過來的，remainingTime已經是 RUN_TIME (1200)
+            if (remainingTime <= 0) {
+                remainingTime = RUN_TIME;
+            }
+            totalRunTimeElapsed = RUN_TIME - remainingTime;
+            updateDisplay();
+
+            // 1. 啟動 Tone.js 傳輸系統
+            Tone.Transport.bpm.value = BPM;
+            Tone.Transport.start();
+            
+            // 2. 設置 Tone.Loop 產生節拍 (如果還沒設置)
+            if (!beatLoop) {
+                beatLoop = new Tone.Loop(time => {
+                    // 節拍組合: 低(0), 低(1), 低(2), 高(3)
+                    if (beatCount === 3) {
+                        runSynthHigh.triggerAttackRelease("G4", "16n", time); // [調整音調 G4]: 跑步階段的高音 (第 4 拍)
+                    } else {
+                        runSynthLow.triggerAttackRelease("C4", "16n", time); // [調整音調 C4]: 跑步階段的低音 (第 1, 2, 3 拍)
+                    }
+                    
+                    // 更新計數器 (0 -> 1 -> 2 -> 3 -> 0)
+                    beatCount = (beatCount + 1) % 4; 
+                    updateDisplay(); // 更新節拍狀態顯示
+                }, `${BEAT_INTERVAL}n`);
+                beatLoop.start(0);
+            }
+
+            // 3. 設置 JavaScript 的計時器來更新螢幕和倒數
+            startRunInterval();
+        }
+
+        // --- Phase 3: 結束階段 (3秒長音) ---
+
+        function stopRunningPhase() {
+            currentPhase = 'FINISH';
+            updateDisplay();
+            
+            // 停止 Tone.js 循環和傳輸
+            if (beatLoop) {
+                beatLoop.dispose();
+                beatLoop = null;
+            }
+            Tone.Transport.stop();
+
+            // 播放 3 秒長音
+            finishSynth.triggerAttackRelease("C5", 3); // [調整音調 C5]: 訓練結束長音
+            
+            // 3秒後自動進入停止狀態
+            setTimeout(() => {
+                currentPhase = 'STOPPED';
+                updateDisplay();
+            }, 3000);
+        }
+
+        // --- 暫停/繼續控制函數 ---
+
+        function pauseTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+            }
+            if (currentPhase === 'RUNNING') {
+                Tone.Transport.pause(); // 暫停節拍
+            }
+
+            isPaused = true;
+            pauseButton().textContent = '繼續訓練';
+            pauseButton().classList.replace('bg-warning', 'bg-accent'); // 繼續使用綠色
+            updateDisplay();
+        }
+
+        function resumeTimer() {
+            isPaused = false;
+            pauseButton().textContent = '暫停訓練';
+            pauseButton().classList.replace('bg-accent', 'bg-warning'); // 暫停使用黃色
+
+            if (currentPhase === 'PREP') {
+                startPrepInterval();
+            } else if (currentPhase === 'RUNNING') {
+                startRunInterval();
+                Tone.Transport.start(); // 恢復節拍
+            }
+            updateDisplay();
+        }
+
+        function togglePause() {
+            if (isPaused) {
+                resumeTimer();
+            } else {
+                pauseTimer();
+            }
+        }
+        
+        // --- 主要控制函數 ---
+
+        function startTimer() {
+            // 確保音訊環境啟動 (重要 for iPhone)
+            initializeAudio(); 
+            startPreparation();
+        }
+
+        function resetTimer() {
+            // 清理所有計時器和 Tone.js
+            clearInterval(timerInterval);
+            if (beatLoop) {
+                beatLoop.dispose();
+                beatLoop = null;
+            }
+            Tone.Transport.stop();
+
+            // 重置狀態變數
+            currentPhase = 'STOPPED';
+            isPaused = false;
+            remainingTime = RUN_TIME;
+            beatCount = 0;
+            totalRunTimeElapsed = 0;
+
+            // 重置 UI
+            pauseButton().textContent = '暫停訓練';
+            pauseButton().classList.replace('bg-accent', 'bg-warning');
+            updateDisplay();
+        }
+
+        // DOM 加載完成後初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            // 初始顯示 20:00
+            updateDisplay();
+            startButton().addEventListener('click', startTimer);
+            pauseButton().addEventListener('click', togglePause);
+            resetButton().addEventListener('click', resetTimer);
+        });
+
+    </script>
+</head>
+<body class="flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div class="w-full max-w-sm bg-gray-800 p-8 rounded-2xl shadow-2xl space-y-8 border-4 border-primary">
+        
+        <h1 class="text-3xl font-extrabold text-white text-center">
+            超慢跑訓練計時器
+        </h1>
+
+        <!-- 狀態顯示 -->
+        <div class="text-center">
+            <p id="statusDisplay" class="text-lg font-semibold text-white text-center mb-4">
+                超慢跑計時器 - 準備開始
+            </p>
+            <!-- 主要計時器顯示 -->
+            <div id="timeDisplay" class="timer-display text-7xl font-bold text-primary tracking-wider p-4 bg-gray-900 rounded-xl shadow-inner border border-primary/50">
+                20:00
+            </div>
+            <p class="text-sm text-gray-400 mt-2">
+                目標步頻: 180 BPM (低低低高 組合)
+            </p>
+        </div>
+
+        <!-- 控制按鈕 -->
+        <div class="flex space-x-2">
+            <button id="startButton" class="flex-1 bg-accent text-gray-900 font-bold py-3 rounded-xl shadow-lg hover:bg-emerald-600 transition duration-150 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed" onclick="startTimer()">
+                開始訓練
+            </button>
+            <button id="pauseButton" class="w-1/3 bg-warning text-gray-900 font-bold py-3 rounded-xl shadow-lg hover:bg-yellow-600 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                暫停訓練
+            </button>
+            <button id="resetButton" class="w-1/4 bg-gray-600 text-white font-bold py-3 rounded-xl shadow-lg hover:bg-gray-700 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                重置
+            </button>
+        </div>
+
+        <p class="text-xs text-gray-500 text-center">
+            * 訓練開始前請務必點擊按鈕啟動音訊。
+        </p>
+
+    </div>
+
+</body>
+</html>
